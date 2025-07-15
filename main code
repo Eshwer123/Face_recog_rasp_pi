@@ -1,0 +1,258 @@
+print("Initialization ongoing, wait for some seconds")
+
+import face_recognition
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+import time
+import logging
+import os
+import smtplib
+from email.message import EmailMessage
+import requests
+from datetime import datetime
+
+# Setup logging
+logging.basicConfig(filename='face_detection.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+
+# Email alert configuration
+def send_email_alert(image_path):
+    EMAIL_ADDRESS = "23l603@psgitech.ac.in"      # Replace with sender email
+    EMAIL_PASSWORD = "sydtajjozuhjugoe"        # Use App Password (not regular password)
+    RECEIVER_EMAIL = "23l601@psgitech.ac.in" # Replace with recipient email
+
+    msg = EmailMessage()
+    msg['Subject'] = '🚨 Unknown Person Detected'
+    msg['From'] = EMAIL_ADDRESS
+    msg['To'] = RECEIVER_EMAIL
+    msg.set_content(f"An unknown person was detected at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.")
+
+    try:
+        with open(image_path, 'rb') as img:
+            img_data = img.read()
+            msg.add_attachment(img_data, maintype='image', subtype='jpg', filename=os.path.basename(image_path))
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            smtp.send_message(msg)
+        print("Email sent successfully.")
+        logging.info("Email sent successfully.")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+        logging.error(f"Failed to send email: {e}")
+
+
+# Directory to save unknown face images
+UNKNOWN_IMAGE_DIR = "/home/ESHWER/face_reg/unknown/"
+if not os.path.exists(UNKNOWN_IMAGE_DIR):
+    os.makedirs(UNKNOWN_IMAGE_DIR)
+
+GPIO.setmode(GPIO.BOARD)
+GPIO.setwarnings(False)
+
+# --- GPIO PIN DEFINITIONS ---
+relay_pin = 22  # Single-channel relay IN pin (active-low), GPIO 25
+LED_PIN = 29
+MOTOR_IN1 = 33
+MOTOR_IN2 = 35
+
+# Setup GPIO pins
+GPIO.setup(LED_PIN, GPIO.OUT)
+GPIO.setup(relay_pin, GPIO.OUT)
+GPIO.setup(MOTOR_IN1, GPIO.OUT)
+GPIO.setup(MOTOR_IN2, GPIO.OUT)
+
+
+# Turn off motor and lock solenoid initially
+GPIO.output(MOTOR_IN1, GPIO.LOW)
+GPIO.output(MOTOR_IN2, GPIO.LOW)
+GPIO.output(relay_pin, GPIO.HIGH)  # Active-low: HIGH to keep solenoid locked
+
+
+# Face images
+image = "/home/ESHWER/face_reg/RAAMESHWER.jpg"
+image2 = "/home/ESHWER/face_reg/SUDHIR_VIKASH.jpeg"
+
+# Webcam
+video_capture = cv2.VideoCapture(0)
+
+# Load known face encodings
+Rahul_image = face_recognition.load_image_file(image)
+Rahul_face_encoding = face_recognition.face_encodings(Rahul_image)[0]
+Pranali_image = face_recognition.load_image_file(image2)
+Pranali_face_encoding = face_recognition.face_encodings(Pranali_image)[0]
+
+known_face_encodings = [Rahul_face_encoding, Pranali_face_encoding]
+known_face_names = ["RAAM ESHWER", "SUDHIR"]
+
+door_open_status = 0
+face_locations = []
+face_encodings = []
+face_names = []
+process_this_frame = True
+unknown_face_start_time = None
+UNKNOWN_TIME_LIMIT = 7  # Seconds to wait before sending WhatsApp message
+
+# --- SOLENOID LOCK FUNCTIONS ---
+def lock_solenoid():
+    GPIO.output(relay_pin, GPIO.HIGH)  # Active-low: HIGH to lock
+    logging.info("Solenoid lock closed")
+
+def unlock_solenoid():
+    GPIO.output(relay_pin, GPIO.LOW)  # Active-low: LOW to unlock
+    logging.info("Solenoid lock opened")
+    time.sleep(2)
+    lock_solenoid()
+
+def is_valid_face_location(location):
+    top, right, bottom, left = location
+    return right > left and bottom > top
+
+# --- MOTOR CONTROL FUNCTIONS ---
+def start_motor():
+    GPIO.output(MOTOR_IN1, GPIO.HIGH)
+    GPIO.output(MOTOR_IN2, GPIO.LOW)
+    logging.info("Motor started (forward)")
+    time.sleep(2)
+
+def stop_motor():
+    GPIO.output(MOTOR_IN1, GPIO.LOW)
+    GPIO.output(MOTOR_IN2, GPIO.LOW)
+    logging.info("Motor stopped")
+    time.sleep(2)
+
+       
+
+# Initial state
+GPIO.output(LED_PIN, GPIO.LOW)
+lock_solenoid()
+stop_motor()
+
+try:
+    while True:
+        # Retry frame capture
+        max_retries = 3
+        for _ in range(max_retries):
+            ret, frame = video_capture.read()
+            if ret and frame is not None:
+                break
+            print("Retrying frame capture...")
+            logging.warning("Retrying frame capture")
+            time.sleep(0.1)
+        else:
+            print("Failed to capture frame after retries.")
+            logging.error("Failed to capture frame after retries")
+            time.sleep(0.1)
+            continue
+
+        small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+        rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+
+        if process_this_frame:
+            face_locations = face_recognition.face_locations(rgb_small_frame, model="hog")
+            if not face_locations:
+                print("No faces detected.")
+                logging.info("No faces detected")
+                GPIO.output(LED_PIN, GPIO.LOW)
+                lock_solenoid()
+                stop_motor()
+                unknown_face_start_time = None
+                continue
+
+            valid_face_locations = [loc for loc in face_locations if is_valid_face_location(loc)]
+            if not valid_face_locations:
+                print("No valid face locations detected.")
+                logging.info("No valid face locations detected")
+                GPIO.output(LED_PIN, GPIO.LOW)
+                lock_solenoid()
+                stop_motor()
+                unknown_face_start_time = None
+                continue
+
+            try:
+                face_encodings = face_recognition.face_encodings(rgb_small_frame, valid_face_locations)
+            except Exception as e:
+                print(f"Error computing face encodings: {e}")
+                logging.error(f"Error computing face encodings: {e}")
+                GPIO.output(LED_PIN, GPIO.LOW)
+                lock_solenoid()
+                stop_motor()
+                unknown_face_start_time = None
+                continue
+
+            if not face_encodings:
+                print("No face encodings found.")
+                logging.info("No face encodings found")
+                GPIO.output(LED_PIN, GPIO.LOW)
+                lock_solenoid()
+                stop_motor()
+                unknown_face_start_time = None
+                continue
+
+            face_names = []
+            authorized_detected = False
+
+            for face_encoding in face_encodings:
+                matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
+                name = "Unknown"
+                face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+                best_match_index = np.argmin(face_distances)
+                if matches[best_match_index] and face_distances[best_match_index] < 0.6:
+                    name = known_face_names[best_match_index]
+                    authorized_detected = True
+                face_names.append(name)
+                print(f"Recognized: {name}, Distance: {face_distances[best_match_index]:.3f}")
+                logging.info(f"Recognized: {name}, Distance: {face_distances[best_match_index]:.3f}")
+
+            # --- Actuate based on result ---
+            if authorized_detected:
+                GPIO.output(LED_PIN, GPIO.HIGH)
+                start_motor()
+                if door_open_status == 0:
+                    door_open_status = 1
+                    unlock_solenoid()
+                unknown_face_start_time = None
+            else:
+                GPIO.output(LED_PIN, GPIO.LOW)
+                lock_solenoid()
+                stop_motor()
+                # Handle unknown face timing
+                if any(name == "Unknown" for name in face_names):
+                    if unknown_face_start_time is None:
+                        unknown_face_start_time = time.time()
+                    elif time.time() - unknown_face_start_time >= UNKNOWN_TIME_LIMIT:
+                        # Save and send image
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        image_path = os.path.join(UNKNOWN_IMAGE_DIR, f"unknown_{timestamp}.jpg")
+                        cv2.imwrite(image_path, frame)
+                        print(f"Unknown face image saved: {image_path}")
+                        logging.info(f"Unknown face image saved: {image_path}")
+                        send_email_alert(image_path)
+                        unknown_face_start_time = None
+                else:
+                    unknown_face_start_time = None
+
+        process_this_frame = not process_this_frame
+
+        for (top, right, bottom, left), name in zip(face_locations, face_names):
+            top *= 2
+            right *= 2
+            bottom *= 2
+            left *= 2
+            cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
+            cv2.rectangle(frame, (left, bottom - 35), (right, bottom), (0, 0, 255), cv2.FILLED)
+            font = cv2.FONT_HERSHEY_DUPLEX
+            cv2.putText(frame, name, (left + 6, bottom - 6), font, 1.0, (255, 255, 255), 1)
+
+        cv2.imshow('Video', frame)
+        if cv2.waitKey(2) == 27:
+            break
+
+except KeyboardInterrupt:
+    print("Program stopped manually.")
+    logging.info("Program stopped manually.")
+
+finally:
+    video_capture.release()
+    cv2.destroyAllWindows()
+    GPIO.cleanup()
